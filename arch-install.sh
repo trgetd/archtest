@@ -1,12 +1,12 @@
 #!/bin/bash
 #
-# Arch Linux Installation Script
-#
+# Arch Linux Installation Script - Interactive TUI
+# Single-file, menu-driven, error-resistant
 #
 # Usage: ./install.sh [config-file]
 #
 
-set -euo pipefail
+set -uo pipefail
 
 # ============================================================================
 # COLORS & UI FUNCTIONS
@@ -24,46 +24,38 @@ success() { echo -e "${GREEN}[✓]${NC} $*"; }
 warning() { echo -e "${YELLOW}[!]${NC} $*"; }
 error() { echo -e "${RED}[✗]${NC} $*" >&2; }
 
-step() {
-    echo ""
-    echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    echo -e "${CYAN}▶ $*${NC}"
-    echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    echo ""
+# ============================================================================
+# TUI FUNCTIONS (using whiptail)
+# ============================================================================
+
+msgbox() {
+    whiptail --title "$1" --msgbox "$2" 20 70
 }
 
-confirm() {
-    local prompt="$1"
-    local default="${2:-n}"
-    local response
-    
-    if [[ "$default" == "y" ]]; then
-        read -p "$prompt [Y/n]: " response
-        response=${response:-y}
-    else
-        read -p "$prompt [y/N]: " response
-        response=${response:-n}
-    fi
-    
-    [[ "$response" =~ ^[Yy]$ ]]
+yesno() {
+    whiptail --title "$1" --yesno "$2" 10 60
 }
 
-input_prompt() {
-    local prompt="$1"
-    local default="$2"
-    local result
-    
-    if [[ -n "$default" ]]; then
-        read -p "$prompt [$default]: " result
-        echo "${result:-$default}"
-    else
-        read -p "$prompt: " result
-        echo "$result"
-    fi
+inputbox() {
+    local title="$1"
+    local prompt="$2"
+    local default="$3"
+    whiptail --title "$title" --inputbox "$prompt" 10 60 "$default" 3>&1 1>&2 2>&3
+}
+
+menu() {
+    local title="$1"
+    local prompt="$2"
+    shift 2
+    whiptail --title "$title" --menu "$prompt" 20 70 10 "$@" 3>&1 1>&2 2>&3
+}
+
+gauge() {
+    whiptail --title "$1" --gauge "$2" 8 70 0
 }
 
 # ============================================================================
-# CONFIGURATION VARIABLES (can be overridden by config file)
+# CONFIGURATION VARIABLES
 # ============================================================================
 
 HOSTNAME=""
@@ -76,23 +68,28 @@ ROOT_FS="ext4"
 USERNAME=""
 USER_PASSWORD=""
 ROOT_PASSWORD=""
-BOOTLOADER="grub"  # or "systemd-boot"
+BOOTLOADER="systemd-boot"
 INSTALL_WIFI=true
 INSTALL_BASE_DEVEL=true
+
+# Step tracking
+STEP_KEYBOARD=0
+STEP_NETWORK=0
+STEP_PARTITION=0
+STEP_BASEINSTALL=0
+STEP_CONFIGURE=0
+STEP_USERS=0
+STEP_PACKAGES=0
+STEP_BOOTLOADER=0
 
 # ============================================================================
 # LOAD CONFIG FILE (if provided)
 # ============================================================================
 
 CONFIG_FILE="${1:-}"
-
 if [[ -n "$CONFIG_FILE" && -f "$CONFIG_FILE" ]]; then
-    info "Loading configuration from: $CONFIG_FILE"
     source "$CONFIG_FILE"
-    CONFIG_MODE="auto"
-else
-    info "No config file provided - interactive mode"
-    CONFIG_MODE="interactive"
+    msgbox "Config Loaded" "Configuration loaded from:\n$CONFIG_FILE"
 fi
 
 # ============================================================================
@@ -100,7 +97,7 @@ fi
 # ============================================================================
 
 if [[ $EUID -ne 0 ]]; then
-    error "This script must be run as root"
+    echo "This script must be run as root"
     exit 1
 fi
 
@@ -110,537 +107,574 @@ fi
 
 if [[ -d /sys/firmware/efi/efivars ]]; then
     UEFI_MODE=1
-    info "UEFI mode detected"
+    BOOT_MODE="UEFI"
 else
     UEFI_MODE=0
-    info "BIOS mode detected"
+    BOOT_MODE="BIOS"
 fi
 
 # ============================================================================
-# START LOGGING
+# LOGGING
 # ============================================================================
 
 LOG_FILE="install-$(date +%Y%m%d-%H%M%S).log"
 exec > >(tee -a "$LOG_FILE")
 exec 2>&1
 
-info "Installation started at $(date)"
-info "Log file: $LOG_FILE"
-
 # ============================================================================
-# STEP 1: KEYBOARD LAYOUT
+# STEP FUNCTIONS
 # ============================================================================
 
-step "Step 1: Keyboard Layout"
-
-if [[ -z "$KEYMAP" ]]; then
-    echo "Common keymaps: us, de, fr, es, it, uk"
-    KEYMAP=$(input_prompt "Enter keyboard layout" "us")
-fi
-
-info "Loading keymap: $KEYMAP"
-loadkeys "$KEYMAP"
-success "Keymap loaded"
-
-# ============================================================================
-# STEP 2: NETWORK CONFIGURATION
-# ============================================================================
-
-step "Step 2: Network Configuration"
-
-info "Testing internet connection..."
-if ping -c 1 -W 2 archlinux.org &>/dev/null; then
-    success "Internet connection available"
-else
-    warning "No internet connection detected"
-    
-    if confirm "Configure network now?"; then
-        echo ""
-        echo "Network options:"
-        echo "  1) Ethernet (DHCP)"
-        echo "  2) WiFi"
-        read -p "Select option: " net_choice
+step_keyboard() {
+    while true; do
+        KEYMAP=$(inputbox "Keyboard Layout" "Enter keyboard layout (e.g., us, de, fr, es):" "${KEYMAP:-us}")
         
-        case $net_choice in
-            1)
-                info "Available interfaces:"
-                ip link show | grep -E "^[0-9]+" | awk '{print $2}' | sed 's/://'
-                
-                iface=$(input_prompt "Enter interface name" "")
-                info "Configuring $iface with DHCP..."
-                ip link set "$iface" up
-                dhcpcd "$iface"
-                sleep 3
-                ;;
-            2)
-                info "Available wireless interfaces:"
-                iw dev | grep Interface | awk '{print $2}'
-                
-                iface=$(input_prompt "Enter wireless interface" "wlan0")
-                ip link set "$iface" up
-                
-                info "Scanning networks..."
-                iwctl station "$iface" scan
-                sleep 2
-                iwctl station "$iface" get-networks
-                
-                ssid=$(input_prompt "Enter SSID" "")
-                read -sp "Enter password: " password
-                echo ""
-                
-                info "Connecting to $ssid..."
-                iwctl --passphrase "$password" station "$iface" connect "$ssid"
-                sleep 5
-                ;;
-        esac
+        if [[ -z "$KEYMAP" ]]; then
+            msgbox "Error" "Keyboard layout cannot be empty!"
+            continue
+        fi
         
-        if ping -c 1 -W 2 archlinux.org &>/dev/null; then
-            success "Internet connected"
+        if loadkeys "$KEYMAP" 2>/dev/null; then
+            STEP_KEYBOARD=1
+            msgbox "Success" "Keymap '$KEYMAP' loaded successfully!"
+            return 0
         else
-            error "Still no internet - continuing anyway"
+            msgbox "Error" "Invalid keymap: $KEYMAP\n\nPlease try again."
+        fi
+    done
+}
+
+step_network() {
+    if ping -c 1 -W 2 archlinux.org &>/dev/null; then
+        if yesno "Network Status" "Internet connection detected!\n\nConnection is working. Continue?"; then
+            timedatectl set-ntp true
+            STEP_NETWORK=1
+            return 0
         fi
     fi
-fi
-
-# Sync time
-info "Synchronizing system clock..."
-timedatectl set-ntp true
-success "System clock synchronized"
-
-# ============================================================================
-# STEP 3: DISK PARTITIONING
-# ============================================================================
-
-step "Step 3: Disk Partitioning"
-
-info "Available disks:"
-lsblk -dno NAME,SIZE,TYPE | grep disk | nl -w2 -s") "
-echo ""
-
-if [[ -z "$TARGET_DISK" ]]; then
-    read -p "Enter disk number or path (e.g., /dev/sda): " disk_input
     
-    if [[ "$disk_input" =~ ^[0-9]+$ ]]; then
-        TARGET_DISK="/dev/$(lsblk -dno NAME | grep -v loop | sed -n "${disk_input}p")"
-    else
-        TARGET_DISK="$disk_input"
+    local choice=$(menu "Network Configuration" "Choose network setup method:" \
+        "1" "Ethernet (DHCP)" \
+        "2" "WiFi (iwctl)" \
+        "3" "Skip (no internet)" \
+        "4" "Test connection")
+    
+    case $choice in
+        1)
+            local interfaces=$(ip -br link | awk '$1 !~ /^lo/ {print $1}' | grep -v wl)
+            local iface_array=()
+            while IFS= read -r iface; do
+                iface_array+=("$iface" "Ethernet")
+            done <<< "$interfaces"
+            
+            if [[ ${#iface_array[@]} -eq 0 ]]; then
+                msgbox "Error" "No ethernet interfaces found!"
+                return 1
+            fi
+            
+            local iface=$(menu "Select Interface" "Choose ethernet interface:" "${iface_array[@]}")
+            
+            if [[ -n "$iface" ]]; then
+                ip link set "$iface" up
+                dhcpcd "$iface" &
+                sleep 3
+                
+                if ping -c 1 -W 2 archlinux.org &>/dev/null; then
+                    timedatectl set-ntp true
+                    STEP_NETWORK=1
+                    msgbox "Success" "Network configured successfully!"
+                    return 0
+                else
+                    msgbox "Error" "Failed to get internet connection."
+                    return 1
+                fi
+            fi
+            ;;
+            
+        2)
+            local wifi_ifaces=$(ip -br link | awk '$1 ~ /^wl/ {print $1}')
+            if [[ -z "$wifi_ifaces" ]]; then
+                msgbox "Error" "No wireless interfaces found!"
+                return 1
+            fi
+            
+            local iface=$(echo "$wifi_ifaces" | head -1)
+            ip link set "$iface" up
+            sleep 2
+            
+            iwctl station "$iface" scan
+            sleep 3
+            
+            local networks=$(iwctl station "$iface" get-networks | tail -n +5 | awk '{print $1}' | grep -v "^$")
+            local net_array=()
+            while IFS= read -r net; do
+                [[ -n "$net" ]] && net_array+=("$net" "WiFi")
+            done <<< "$networks"
+            
+            if [[ ${#net_array[@]} -eq 0 ]]; then
+                msgbox "Error" "No networks found!"
+                return 1
+            fi
+            
+            local ssid=$(menu "Select Network" "Choose WiFi network:" "${net_array[@]}")
+            
+            if [[ -n "$ssid" ]]; then
+                local password=$(inputbox "WiFi Password" "Enter password for '$ssid':" "")
+                
+                iwctl --passphrase "$password" station "$iface" connect "$ssid" 2>&1 | tee -a "$LOG_FILE"
+                sleep 5
+                
+                if ping -c 1 -W 2 archlinux.org &>/dev/null; then
+                    timedatectl set-ntp true
+                    STEP_NETWORK=1
+                    msgbox "Success" "WiFi connected successfully!"
+                    return 0
+                else
+                    msgbox "Error" "Failed to connect to WiFi."
+                    return 1
+                fi
+            fi
+            ;;
+            
+        3)
+            if yesno "Skip Network" "Continue without internet?\n\nSome features may not work."; then
+                STEP_NETWORK=1
+                return 0
+            fi
+            return 1
+            ;;
+            
+        4)
+            if ping -c 3 archlinux.org; then
+                msgbox "Connection Test" "Internet connection is working!"
+            else
+                msgbox "Connection Test" "No internet connection detected."
+            fi
+            return 1
+            ;;
+    esac
+}
+
+step_partition() {
+    # Show available disks
+    local disks=$(lsblk -dno NAME,SIZE,TYPE | grep disk)
+    local disk_array=()
+    local i=1
+    while IFS= read -r line; do
+        local name=$(echo "$line" | awk '{print $1}')
+        local size=$(echo "$line" | awk '{print $2}')
+        disk_array+=("/dev/$name" "$size")
+        ((i++))
+    done <<< "$disks"
+    
+    TARGET_DISK=$(menu "Select Disk" "WARNING: Selected disk will be WIPED!\n\nChoose installation disk:" "${disk_array[@]}")
+    
+    if [[ -z "$TARGET_DISK" ]]; then
+        msgbox "Error" "No disk selected!"
+        return 1
     fi
-fi
-
-info "Selected disk: $TARGET_DISK"
-echo ""
-lsblk "$TARGET_DISK"
-echo ""
-
-warning "ALL DATA ON $TARGET_DISK WILL BE DESTROYED!"
-if ! confirm "Continue with partitioning?"; then
-    error "Installation aborted"
-    exit 1
-fi
-
-# Determine partition naming
-if [[ "$TARGET_DISK" =~ nvme ]]; then
-    PART_PREFIX="${TARGET_DISK}p"
-else
-    PART_PREFIX="${TARGET_DISK}"
-fi
-
-# Calculate swap size
-if [[ "$SWAP_SIZE" == "auto" ]]; then
-    ram_mb=$(free -m | awk '/^Mem:/ {print $2}')
-    if [ "$ram_mb" -lt 2048 ]; then
-        SWAP_SIZE="$((ram_mb * 2))M"
-    elif [ "$ram_mb" -lt 8192 ]; then
-        SWAP_SIZE="${ram_mb}M"
-    else
-        SWAP_SIZE="$((ram_mb / 2))M"
+    
+    # Show disk info
+    local disk_info=$(lsblk "$TARGET_DISK")
+    if ! yesno "Confirm Disk" "Selected disk: $TARGET_DISK\n\n$disk_info\n\nALL DATA WILL BE DESTROYED!\n\nContinue?"; then
+        return 1
     fi
-    info "Calculated swap size: $SWAP_SIZE"
-fi
-
-# Wipe disk
-info "Wiping disk signatures..."
-wipefs -af "$TARGET_DISK"
-sgdisk --zap-all "$TARGET_DISK"
-success "Disk wiped"
-
-# Partition based on UEFI or BIOS
-if [[ "$UEFI_MODE" -eq 1 ]]; then
-    info "Creating GPT partitions (UEFI)..."
     
-    sgdisk -n 1:0:+512M -t 1:ef00 -c 1:"EFI" "$TARGET_DISK"
-    sgdisk -n 2:0:+${SWAP_SIZE} -t 2:8200 -c 2:"SWAP" "$TARGET_DISK"
-    sgdisk -n 3:0:0 -t 3:8300 -c 3:"ROOT" "$TARGET_DISK"
+    # Swap size
+    SWAP_SIZE=$(inputbox "Swap Size" "Enter swap size (e.g., 8G, 4G, or 'auto'):" "${SWAP_SIZE:-auto}")
     
-    EFI_PART="${PART_PREFIX}1"
-    SWAP_PART="${PART_PREFIX}2"
-    ROOT_PART="${PART_PREFIX}3"
+    if [[ "$SWAP_SIZE" == "auto" ]]; then
+        local ram_mb=$(free -m | awk '/^Mem:/ {print $2}')
+        if [ "$ram_mb" -lt 2048 ]; then
+            SWAP_SIZE="$((ram_mb * 2))M"
+        elif [ "$ram_mb" -lt 8192 ]; then
+            SWAP_SIZE="${ram_mb}M"
+        else
+            SWAP_SIZE="$((ram_mb / 2))M"
+        fi
+    fi
     
-    success "GPT partitions created"
-else
-    info "Creating MBR partitions (BIOS)..."
+    # Filesystem
+    ROOT_FS=$(menu "Filesystem" "Choose root filesystem:" \
+        "ext4" "Stable, reliable" \
+        "btrfs" "Advanced features" \
+        "xfs" "High performance")
     
+    # Partition naming
+    if [[ "$TARGET_DISK" =~ nvme ]]; then
+        PART_PREFIX="${TARGET_DISK}p"
+    else
+        PART_PREFIX="${TARGET_DISK}"
+    fi
+    
+    # Wipe disk
     (
-        echo o
-        echo n; echo p; echo 1; echo; echo "+${SWAP_SIZE}"
-        echo t; echo 82
-        echo n; echo p; echo 2; echo; echo
-        echo w
-    ) | fdisk "$TARGET_DISK"
+        echo "0"; echo "# Wiping disk..."
+        wipefs -af "$TARGET_DISK" &>/dev/null
+        echo "20"; echo "# Clearing partition table..."
+        sgdisk --zap-all "$TARGET_DISK" &>/dev/null
+        echo "40"; echo "# Creating partitions..."
+        
+        if [[ "$UEFI_MODE" -eq 1 ]]; then
+            sgdisk -n 1:0:+512M -t 1:ef00 -c 1:"EFI" "$TARGET_DISK" &>/dev/null
+            sgdisk -n 2:0:+${SWAP_SIZE} -t 2:8200 -c 2:"SWAP" "$TARGET_DISK" &>/dev/null
+            sgdisk -n 3:0:0 -t 3:8300 -c 3:"ROOT" "$TARGET_DISK" &>/dev/null
+            
+            EFI_PART="${PART_PREFIX}1"
+            SWAP_PART="${PART_PREFIX}2"
+            ROOT_PART="${PART_PREFIX}3"
+        else
+            (
+                echo o
+                echo n; echo p; echo 1; echo; echo "+${SWAP_SIZE}"
+                echo t; echo 82
+                echo n; echo p; echo 2; echo; echo
+                echo w
+            ) | fdisk "$TARGET_DISK" &>/dev/null
+            
+            SWAP_PART="${PART_PREFIX}1"
+            ROOT_PART="${PART_PREFIX}2"
+        fi
+        
+        echo "60"; echo "# Waiting for kernel..."
+        sleep 2
+        partprobe "$TARGET_DISK"
+        sleep 1
+        
+        echo "70"; echo "# Formatting partitions..."
+        
+        if [[ "$UEFI_MODE" -eq 1 ]]; then
+            mkfs.fat -F32 "$EFI_PART" &>/dev/null
+        fi
+        
+        mkswap "$SWAP_PART" &>/dev/null
+        swapon "$SWAP_PART" &>/dev/null
+        
+        case "$ROOT_FS" in
+            ext4) mkfs.ext4 -F "$ROOT_PART" &>/dev/null ;;
+            btrfs) mkfs.btrfs -f "$ROOT_PART" &>/dev/null ;;
+            xfs) mkfs.xfs -f "$ROOT_PART" &>/dev/null ;;
+        esac
+        
+        echo "90"; echo "# Mounting partitions..."
+        mount "$ROOT_PART" /mnt
+        
+        if [[ "$UEFI_MODE" -eq 1 ]]; then
+            mkdir -p /mnt/boot
+            mount "$EFI_PART" /mnt/boot
+        fi
+        
+        echo "100"; echo "# Done!"
+        sleep 1
+    ) | gauge "Partitioning" "Preparing disk..."
     
-    SWAP_PART="${PART_PREFIX}1"
-    ROOT_PART="${PART_PREFIX}2"
+    STEP_PARTITION=1
+    msgbox "Success" "Disk partitioned and mounted successfully!\n\nRoot: $ROOT_PART ($ROOT_FS)\nSwap: $SWAP_PART ($SWAP_SIZE)\n$([ "$UEFI_MODE" -eq 1 ] && echo "EFI: $EFI_PART")"
+    return 0
+}
+
+step_baseinstall() {
+    if ! mountpoint -q /mnt; then
+        msgbox "Error" "Root partition not mounted!\n\nPlease complete partitioning first."
+        return 1
+    fi
     
-    success "MBR partitions created"
-fi
+    local BASE_PKGS="base linux linux-firmware"
+    
+    if yesno "Base Devel" "Install base-devel group?\n\n(Compilers and build tools - recommended)"; then
+        BASE_PKGS="$BASE_PKGS base-devel"
+    fi
+    
+    if yesno "WiFi Support" "Install wireless tools?"; then
+        BASE_PKGS="$BASE_PKGS wpa_supplicant wireless_tools iw"
+    fi
+    
+    # Detect CPU
+    local cpu_vendor=$(grep -m1 "vendor_id" /proc/cpuinfo | awk '{print $3}')
+    case "$cpu_vendor" in
+        GenuineIntel)
+            BASE_PKGS="$BASE_PKGS intel-ucode"
+            ;;
+        AuthenticAMD)
+            BASE_PKGS="$BASE_PKGS amd-ucode"
+            ;;
+    esac
+    
+    msgbox "Installing" "Installing base system...\n\nPackages: $BASE_PKGS\n\nThis may take several minutes.\nCheck the terminal for progress."
+    
+    if pacstrap /mnt $BASE_PKGS; then
+        genfstab -U /mnt >> /mnt/etc/fstab
+        STEP_BASEINSTALL=1
+        msgbox "Success" "Base system installed successfully!"
+        return 0
+    else
+        msgbox "Error" "Base system installation failed!\n\nCheck the log file:\n$LOG_FILE"
+        return 1
+    fi
+}
 
-# Wait for kernel to recognize partitions
-sleep 2
-partprobe "$TARGET_DISK"
-sleep 1
-
-# Format partitions
-info "Formatting partitions..."
-
-if [[ "$UEFI_MODE" -eq 1 ]]; then
-    mkfs.fat -F32 "$EFI_PART"
-    success "EFI partition formatted"
-fi
-
-mkswap "$SWAP_PART"
-swapon "$SWAP_PART"
-success "Swap partition formatted and enabled"
-
-case "$ROOT_FS" in
-    ext4)
-        mkfs.ext4 -F "$ROOT_PART"
-        ;;
-    btrfs)
-        mkfs.btrfs -f "$ROOT_PART"
-        ;;
-    xfs)
-        mkfs.xfs -f "$ROOT_PART"
-        ;;
-esac
-success "Root partition formatted ($ROOT_FS)"
-
-# Mount partitions
-info "Mounting partitions..."
-mount "$ROOT_PART" /mnt
-
-if [[ "$UEFI_MODE" -eq 1 ]]; then
-    mkdir -p /mnt/boot
-    mount "$EFI_PART" /mnt/boot
-fi
-
-success "Partitions mounted"
-
-# ============================================================================
-# STEP 4: INSTALL BASE SYSTEM
-# ============================================================================
-
-step "Step 4: Installing Base System"
-
-BASE_PKGS="base linux linux-firmware"
-
-if [[ "$INSTALL_BASE_DEVEL" == true ]]; then
-    BASE_PKGS="$BASE_PKGS base-devel"
-fi
-
-if [[ "$INSTALL_WIFI" == true ]]; then
-    BASE_PKGS="$BASE_PKGS wpa_supplicant wireless_tools iw"
-fi
-
-# Detect CPU and add microcode
-cpu_vendor=$(grep -m1 "vendor_id" /proc/cpuinfo | awk '{print $3}')
-case "$cpu_vendor" in
-    GenuineIntel)
-        BASE_PKGS="$BASE_PKGS intel-ucode"
-        info "Intel CPU detected - adding intel-ucode"
-        ;;
-    AuthenticAMD)
-        BASE_PKGS="$BASE_PKGS amd-ucode"
-        info "AMD CPU detected - adding amd-ucode"
-        ;;
-esac
-
-info "Installing base system packages..."
-info "Packages: $BASE_PKGS"
-pacstrap /mnt $BASE_PKGS
-
-success "Base system installed"
-
-# Generate fstab
-info "Generating fstab..."
-genfstab -U /mnt >> /mnt/etc/fstab
-success "fstab generated"
-
-# ============================================================================
-# STEP 5: SYSTEM CONFIGURATION
-# ============================================================================
-
-step "Step 5: System Configuration"
-
-# Get configuration values if not set
-if [[ -z "$TIMEZONE" ]]; then
-    echo "Example: Europe/Berlin, America/New_York, Asia/Tokyo"
-    TIMEZONE=$(input_prompt "Enter timezone" "Europe/Berlin")
-fi
-
-if [[ -z "$LOCALE" ]]; then
-    LOCALE=$(input_prompt "Enter locale" "en_US.UTF-8")
-fi
-
-if [[ -z "$HOSTNAME" ]]; then
-    HOSTNAME=$(input_prompt "Enter hostname" "archlinux")
-fi
-
-# Configure timezone
-info "Setting timezone to $TIMEZONE..."
-arch-chroot /mnt ln -sf /usr/share/zoneinfo/$TIMEZONE /etc/localtime
-arch-chroot /mnt hwclock --systohc
-success "Timezone configured"
-
-# Configure locale
-info "Configuring locale ($LOCALE)..."
-echo "$LOCALE UTF-8" >> /mnt/etc/locale.gen
-arch-chroot /mnt locale-gen
-echo "LANG=$LOCALE" > /mnt/etc/locale.conf
-success "Locale configured"
-
-# Set console keymap
-info "Setting console keymap..."
-echo "KEYMAP=$KEYMAP" > /mnt/etc/vconsole.conf
-success "Console keymap set"
-
-# Set hostname
-info "Setting hostname to $HOSTNAME..."
-echo "$HOSTNAME" > /mnt/etc/hostname
-
-cat > /mnt/etc/hosts <<EOF
+step_configure() {
+    # Timezone
+    TIMEZONE=$(inputbox "Timezone" "Enter timezone (e.g., Europe/Berlin, America/New_York):" "${TIMEZONE:-Europe/Berlin}")
+    
+    arch-chroot /mnt ln -sf /usr/share/zoneinfo/$TIMEZONE /etc/localtime
+    arch-chroot /mnt hwclock --systohc
+    
+    # Locale
+    LOCALE=$(inputbox "Locale" "Enter locale:" "${LOCALE:-en_US.UTF-8}")
+    
+    echo "$LOCALE UTF-8" >> /mnt/etc/locale.gen
+    arch-chroot /mnt locale-gen &>/dev/null
+    echo "LANG=$LOCALE" > /mnt/etc/locale.conf
+    
+    # Hostname
+    HOSTNAME=$(inputbox "Hostname" "Enter hostname:" "${HOSTNAME:-archlinux}")
+    
+    echo "$HOSTNAME" > /mnt/etc/hostname
+    cat > /mnt/etc/hosts <<EOF
 127.0.0.1   localhost
 ::1         localhost
 127.0.1.1   ${HOSTNAME}.localdomain ${HOSTNAME}
 EOF
-success "Hostname configured"
-
-# Configure pacman
-info "Configuring pacman..."
-sed -i 's/^#Color/Color/' /mnt/etc/pacman.conf
-sed -i 's/^#ParallelDownloads.*/ParallelDownloads = 5/' /mnt/etc/pacman.conf
-
-if confirm "Enable multilib repository (32-bit support)?"; then
-    sed -i '/\[multilib\]/,/Include/s/^#//' /mnt/etc/pacman.conf
-    success "Multilib enabled"
-fi
-
-# Generate initramfs
-info "Generating initramfs..."
-arch-chroot /mnt mkinitcpio -P
-success "Initramfs generated"
-
-# ============================================================================
-# STEP 6: USERS & PASSWORDS
-# ============================================================================
-
-step "Step 6: Users and Passwords"
-
-# Root password
-info "Setting root password..."
-if [[ -n "$ROOT_PASSWORD" ]]; then
-    echo "root:${ROOT_PASSWORD}" | arch-chroot /mnt chpasswd
-    success "Root password set from config"
-else
-    arch-chroot /mnt passwd root
-    success "Root password set"
-fi
-
-# Create user
-if [[ -z "$USERNAME" ]]; then
-    USERNAME=$(input_prompt "Enter username" "")
-fi
-
-info "Creating user: $USERNAME..."
-arch-chroot /mnt useradd -m -G wheel,audio,video,storage,optical,power -s /bin/bash "$USERNAME"
-
-if [[ -n "$USER_PASSWORD" ]]; then
-    echo "${USERNAME}:${USER_PASSWORD}" | arch-chroot /mnt chpasswd
-    success "User password set from config"
-else
-    info "Setting password for $USERNAME..."
-    arch-chroot /mnt passwd "$USERNAME"
-    success "User password set"
-fi
-
-# Configure sudo
-info "Configuring sudo..."
-echo "%wheel ALL=(ALL:ALL) ALL" > /mnt/etc/sudoers.d/wheel
-chmod 440 /mnt/etc/sudoers.d/wheel
-success "Sudo configured for wheel group"
-
-# ============================================================================
-# STEP 7: INSTALL ADDITIONAL PACKAGES
-# ============================================================================
-
-step "Step 7: Additional Packages"
-
-EXTRA_PKGS="networkmanager vim nano tmux htop git openssh"
-
-if confirm "Install additional packages? ($EXTRA_PKGS)"; then
-    info "Installing packages..."
-    arch-chroot /mnt pacman -S --noconfirm $EXTRA_PKGS
-    success "Additional packages installed"
-fi
-
-# Enable NetworkManager
-if arch-chroot /mnt pacman -Q networkmanager &>/dev/null; then
-    info "Enabling NetworkManager..."
-    arch-chroot /mnt systemctl enable NetworkManager
-    success "NetworkManager enabled"
-fi
-
-# Enable SSH (if installed)
-if arch-chroot /mnt pacman -Q openssh &>/dev/null; then
-    if confirm "Enable SSH service?"; then
-        arch-chroot /mnt systemctl enable sshd
-        success "SSH enabled"
+    
+    # Console keymap
+    echo "KEYMAP=$KEYMAP" > /mnt/etc/vconsole.conf
+    
+    # Pacman config
+    sed -i 's/^#Color/Color/' /mnt/etc/pacman.conf
+    sed -i 's/^#ParallelDownloads.*/ParallelDownloads = 5/' /mnt/etc/pacman.conf
+    
+    if yesno "Multilib" "Enable multilib repository?\n\n(32-bit support)"; then
+        sed -i '/\[multilib\]/,/Include/s/^#//' /mnt/etc/pacman.conf
     fi
-fi
-
-# ============================================================================
-# STEP 8: BOOTLOADER
-# ============================================================================
-
-step "Step 8: Bootloader Installation"
-
-if [[ "$BOOTLOADER" == "systemd-boot" ]] && [[ "$UEFI_MODE" -eq 1 ]]; then
-    info "Installing systemd-boot..."
     
-    arch-chroot /mnt bootctl install
+    # Initramfs
+    arch-chroot /mnt mkinitcpio -P &>/dev/null
     
-    # Create loader config
-    cat > /mnt/boot/loader/loader.conf <<EOF
+    STEP_CONFIGURE=1
+    msgbox "Success" "System configured!\n\nTimezone: $TIMEZONE\nLocale: $LOCALE\nHostname: $HOSTNAME"
+    return 0
+}
+
+step_users() {
+    # Root password
+    while true; do
+        local pass1=$(inputbox "Root Password" "Enter root password:" "")
+        local pass2=$(inputbox "Root Password" "Confirm root password:" "")
+        
+        if [[ "$pass1" == "$pass2" ]] && [[ -n "$pass1" ]]; then
+            echo "root:${pass1}" | arch-chroot /mnt chpasswd
+            break
+        else
+            msgbox "Error" "Passwords don't match or are empty!\n\nPlease try again."
+        fi
+    done
+    
+    # Username
+    while true; do
+        USERNAME=$(inputbox "Username" "Enter username:" "${USERNAME:-user}")
+        
+        if [[ "$USERNAME" =~ ^[a-z_][a-z0-9_-]*$ ]]; then
+            break
+        else
+            msgbox "Error" "Invalid username!\n\nUse lowercase letters, numbers, - and _"
+        fi
+    done
+    
+    arch-chroot /mnt useradd -m -G wheel,audio,video,storage,optical,power -s /bin/bash "$USERNAME"
+    
+    # User password
+    while true; do
+        local pass1=$(inputbox "User Password" "Enter password for $USERNAME:" "")
+        local pass2=$(inputbox "User Password" "Confirm password:" "")
+        
+        if [[ "$pass1" == "$pass2" ]] && [[ -n "$pass1" ]]; then
+            echo "${USERNAME}:${pass1}" | arch-chroot /mnt chpasswd
+            break
+        else
+            msgbox "Error" "Passwords don't match or are empty!\n\nPlease try again."
+        fi
+    done
+    
+    # Sudo
+    echo "%wheel ALL=(ALL:ALL) ALL" > /mnt/etc/sudoers.d/wheel
+    chmod 440 /mnt/etc/sudoers.d/wheel
+    
+    STEP_USERS=1
+    msgbox "Success" "User created!\n\nUsername: $USERNAME\nGroups: wheel, audio, video, storage, optical, power"
+    return 0
+}
+
+step_packages() {
+    local EXTRA_PKGS="networkmanager vim nano tmux htop git openssh"
+    
+    if yesno "Additional Packages" "Install additional packages?\n\n$EXTRA_PKGS"; then
+        msgbox "Installing" "Installing packages...\n\nCheck terminal for progress."
+        
+        if arch-chroot /mnt pacman -S --noconfirm $EXTRA_PKGS; then
+            arch-chroot /mnt systemctl enable NetworkManager &>/dev/null
+            
+            if yesno "SSH" "Enable SSH service?"; then
+                arch-chroot /mnt systemctl enable sshd &>/dev/null
+            fi
+            
+            msgbox "Success" "Packages installed successfully!"
+        else
+            msgbox "Warning" "Some packages failed to install.\n\nContinuing anyway..."
+        fi
+    fi
+    
+    # User config
+    cat >> /mnt/home/$USERNAME/.bashrc <<'EOF'
+
+alias ll='ls -lah'
+alias update='sudo pacman -Syu'
+alias install='sudo pacman -S'
+alias ls='ls --color=auto'
+PS1='\[\033[01;32m\]\u@\h\[\033[00m\]:\[\033[01;34m\]\w\[\033[00m\]\$ '
+EOF
+    
+    arch-chroot /mnt chown -R $USERNAME:$USERNAME /home/$USERNAME
+    arch-chroot /mnt systemctl enable systemd-timesyncd &>/dev/null
+    
+    STEP_PACKAGES=1
+    return 0
+}
+
+step_bootloader() {
+    if [[ "$UEFI_MODE" -eq 1 ]]; then
+        BOOTLOADER=$(menu "Bootloader" "Choose bootloader (UEFI):" \
+            "systemd-boot" "Simple, fast" \
+            "grub" "Feature-rich")
+    else
+        BOOTLOADER="grub"
+        msgbox "Bootloader" "BIOS mode detected.\n\nUsing GRUB bootloader."
+    fi
+    
+    if [[ "$BOOTLOADER" == "systemd-boot" ]] && [[ "$UEFI_MODE" -eq 1 ]]; then
+        arch-chroot /mnt bootctl install &>/dev/null
+        
+        cat > /mnt/boot/loader/loader.conf <<EOF
 default arch.conf
 timeout 3
 console-mode max
 editor no
 EOF
-    
-    # Get root UUID
-    ROOT_UUID=$(blkid -s UUID -o value "$ROOT_PART")
-    
-    # Detect microcode
-    MICROCODE=""
-    if arch-chroot /mnt pacman -Q intel-ucode &>/dev/null; then
-        MICROCODE="initrd /intel-ucode.img"
-    elif arch-chroot /mnt pacman -Q amd-ucode &>/dev/null; then
-        MICROCODE="initrd /amd-ucode.img"
-    fi
-    
-    # Create boot entry
-    cat > /mnt/boot/loader/entries/arch.conf <<EOF
+        
+        local ROOT_UUID=$(blkid -s UUID -o value "$ROOT_PART")
+        local MICROCODE=""
+        
+        if arch-chroot /mnt pacman -Q intel-ucode &>/dev/null; then
+            MICROCODE="initrd /intel-ucode.img"
+        elif arch-chroot /mnt pacman -Q amd-ucode &>/dev/null; then
+            MICROCODE="initrd /amd-ucode.img"
+        fi
+        
+        cat > /mnt/boot/loader/entries/arch.conf <<EOF
 title   Arch Linux
 linux   /vmlinuz-linux
 ${MICROCODE}
 initrd  /initramfs-linux.img
 options root=UUID=${ROOT_UUID} rw
 EOF
-    
-    # Create fallback entry
-    cat > /mnt/boot/loader/entries/arch-fallback.conf <<EOF
+        
+        cat > /mnt/boot/loader/entries/arch-fallback.conf <<EOF
 title   Arch Linux (fallback)
 linux   /vmlinuz-linux
 ${MICROCODE}
 initrd  /initramfs-linux-fallback.img
 options root=UUID=${ROOT_UUID} rw
 EOF
-    
-    success "systemd-boot installed"
-    
-elif [[ "$BOOTLOADER" == "grub" ]] || [[ "$UEFI_MODE" -eq 0 ]]; then
-    info "Installing GRUB..."
-    
-    if [[ "$UEFI_MODE" -eq 1 ]]; then
-        arch-chroot /mnt pacman -S --noconfirm grub efibootmgr
-        arch-chroot /mnt grub-install --target=x86_64-efi --efi-directory=/boot --bootloader-id=GRUB
+        
+        STEP_BOOTLOADER=1
+        msgbox "Success" "systemd-boot installed successfully!"
+        
     else
-        arch-chroot /mnt pacman -S --noconfirm grub
-        arch-chroot /mnt grub-install --target=i386-pc "$TARGET_DISK"
+        if [[ "$UEFI_MODE" -eq 1 ]]; then
+            arch-chroot /mnt pacman -S --noconfirm grub efibootmgr &>/dev/null
+            arch-chroot /mnt grub-install --target=x86_64-efi --efi-directory=/boot --bootloader-id=GRUB &>/dev/null
+        else
+            arch-chroot /mnt pacman -S --noconfirm grub &>/dev/null
+            arch-chroot /mnt grub-install --target=i386-pc "$TARGET_DISK" &>/dev/null
+        fi
+        
+        arch-chroot /mnt grub-mkconfig -o /boot/grub/grub.cfg &>/dev/null
+        
+        STEP_BOOTLOADER=1
+        msgbox "Success" "GRUB installed successfully!"
     fi
     
-    arch-chroot /mnt grub-mkconfig -o /boot/grub/grub.cfg
-    success "GRUB installed"
-fi
+    return 0
+}
 
 # ============================================================================
-# STEP 9: FINAL CONFIGURATION
+# MAIN MENU
 # ============================================================================
 
-step "Step 9: Final Configuration"
-
-# Create basic user config files
-info "Creating user configuration files..."
-
-cat >> /mnt/home/$USERNAME/.bashrc <<'EOF'
-
-# Custom aliases
-alias ll='ls -lah'
-alias update='sudo pacman -Syu'
-alias install='sudo pacman -S'
-alias search='pacman -Ss'
-
-# Colored ls
-alias ls='ls --color=auto'
-alias grep='grep --color=auto'
-
-# Better prompt
-PS1='\[\033[01;32m\]\u@\h\[\033[00m\]:\[\033[01;34m\]\w\[\033[00m\]\$ '
-EOF
-
-arch-chroot /mnt chown -R $USERNAME:$USERNAME /home/$USERNAME
-success "User configuration created"
-
-# Enable time sync
-info "Enabling time synchronization..."
-arch-chroot /mnt systemctl enable systemd-timesyncd
-success "Time sync enabled"
+main_menu() {
+    while true; do
+        local status_text="Installation Progress:\n\n"
+        status_text+="[$([ $STEP_KEYBOARD -eq 1 ] && echo "✓" || echo " ")] 1. Keyboard Layout\n"
+        status_text+="[$([ $STEP_NETWORK -eq 1 ] && echo "✓" || echo " ")] 2. Network Configuration\n"
+        status_text+="[$([ $STEP_PARTITION -eq 1 ] && echo "✓" || echo " ")] 3. Disk Partitioning\n"
+        status_text+="[$([ $STEP_BASEINSTALL -eq 1 ] && echo "✓" || echo " ")] 4. Base System Installation\n"
+        status_text+="[$([ $STEP_CONFIGURE -eq 1 ] && echo "✓" || echo " ")] 5. System Configuration\n"
+        status_text+="[$([ $STEP_USERS -eq 1 ] && echo "✓" || echo " ")] 6. Users & Passwords\n"
+        status_text+="[$([ $STEP_PACKAGES -eq 1 ] && echo "✓" || echo " ")] 7. Additional Packages\n"
+        status_text+="[$([ $STEP_BOOTLOADER -eq 1 ] && echo "✓" || echo " ")] 8. Bootloader\n"
+        
+        local choice=$(menu "Arch Installation - $BOOT_MODE Mode" "$status_text\nSelect step:" \
+            "1" "Keyboard Layout" \
+            "2" "Network Configuration" \
+            "3" "Disk Partitioning" \
+            "4" "Base System Installation" \
+            "5" "System Configuration" \
+            "6" "Users & Passwords" \
+            "7" "Additional Packages" \
+            "8" "Bootloader" \
+            "9" "Finish & Reboot" \
+            "0" "Exit")
+        
+        case $choice in
+            1) step_keyboard ;;
+            2) step_network ;;
+            3) step_partition ;;
+            4) step_baseinstall ;;
+            5) step_configure ;;
+            6) step_users ;;
+            7) step_packages ;;
+            8) step_bootloader ;;
+            9)
+                if [[ $STEP_BOOTLOADER -eq 1 ]]; then
+                    if yesno "Finish Installation" "Installation complete!\n\nUnmount partitions and reboot now?"; then
+                        sync
+                        umount -R /mnt &>/dev/null
+                        swapoff -a &>/dev/null
+                        msgbox "Done" "System ready!\n\nRemoving installation media and rebooting in 5 seconds..."
+                        sleep 5
+                        reboot
+                    fi
+                else
+                    msgbox "Warning" "Not all steps completed!\n\nPlease complete the bootloader step first."
+                fi
+                ;;
+            0)
+                if yesno "Exit" "Exit installation?\n\nProgress will be saved."; then
+                    exit 0
+                fi
+                ;;
+            *)
+                exit 0
+                ;;
+        esac
+    done
+}
 
 # ============================================================================
-# INSTALLATION COMPLETE
+# START
 # ============================================================================
 
-step "Installation Complete!"
+clear
+msgbox "Arch Linux Installer" "Welcome to the Arch Linux Installation Script!\n\nBoot Mode: $BOOT_MODE\nLog File: $LOG_FILE\n\nPress OK to continue..."
 
-echo ""
-echo "┌────────────────────────────────────────────────────────┐"
-echo "│                                                        │"
-echo "│  ✓ System installed successfully                      │"
-echo "│                                                        │"
-echo "│  Next steps:                                          │"
-echo "│    1. Exit this script                                │"
-echo "│    2. Unmount: umount -R /mnt                         │"
-echo "│    3. Reboot: reboot                                  │"
-echo "│    4. Remove installation media                       │"
-echo "│    5. Login as: $USERNAME                             │"
-echo "│                                                        │"
-echo "│  Installation log: $LOG_FILE                          │"
-echo "│                                                        │"
-echo "└────────────────────────────────────────────────────────┘"
-echo ""
-
-if confirm "Unmount and reboot now?"; then
-    info "Syncing filesystems..."
-    sync
-    
-    info "Unmounting partitions..."
-    umount -R /mnt
-    swapoff -a
-    
-    success "System ready to reboot"
-    echo ""
-    info "Rebooting in 5 seconds..."
-    sleep 5
-    reboot
-fi
-
-info "Installation finished. Manual reboot required."
+main_menu
