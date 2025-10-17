@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 # Arch Linux Installation Script
-# Single-file, sequential, no hidden background tasks
+#
 #
 # Usage: ./install.sh [config-file]
 #
@@ -76,7 +76,7 @@ ROOT_FS="ext4"
 USERNAME=""
 USER_PASSWORD=""
 ROOT_PASSWORD=""
-BOOTLOADER="systemd-boot"  # or "grub"
+BOOTLOADER="grub"  # or "systemd-boot"
 INSTALL_WIFI=true
 INSTALL_BASE_DEVEL=true
 
